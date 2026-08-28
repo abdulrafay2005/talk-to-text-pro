@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Notification Sound Test</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #f5f5f5;
+    }
+
+    .card {
+      background: white;
+      padding: 40px;
+      border-radius: 16px;
+      text-align: center;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+    }
+
+    button {
+      border: none;
+      padding: 14px 24px;
+      border-radius: 10px;
+      background: #6a5eff;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      opacity: 0.9;
+    }
+
+    #status {
+      margin-top: 20px;
+      color: #666;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <h1>🔔 Notification Sound Test</h1>
+
+    <p>Click the button to test the meeting completion sound.</p>
+
+    <button onclick="playCompletionSound()">
+      🔔 Play Ding-Dong
+    </button>
+
+    <p id="status">Ready to test.</p>
+  </div>
+
+  <script>
+    function playCompletionSound() {
+      try {
+        const AudioContext =
+          window.AudioContext ||
+          window.webkitAudioContext;
+
+        if (!AudioContext) {
+          document.getElementById("status").textContent =
+            "Web Audio API is not supported.";
+          return;
+        }
+
+        const audioContext = new AudioContext();
+
+        const playTone = (frequency, startTime, duration) => {
+          const oscillator = audioContext.createOscillator();
+          const gainNode = audioContext.createGain();
+
+          oscillator.type = "sine";
+
+          oscillator.frequency.setValueAtTime(
+            frequency,
+            startTime
+          );
+
+          gainNode.gain.setValueAtTime(
+            0.0001,
+            startTime
+          );
+
+          gainNode.gain.exponentialRampToValueAtTime(
+            0.18,
+            startTime + 0.02
+          );
+
+          gainNode.gain.exponentialRampToValueAtTime(
+            0.0001,
+            startTime + duration
+          );
+
+          oscillator.connect(gainNode);
+          gainNode.connect(audioContext.destination);
+
+          oscillator.start(startTime);
+          oscillator.stop(startTime + duration);
+        };
+
+        const startTime = audioContext.currentTime;
+
+        // First note - Ding
+        playTone(880, startTime, 0.22);
+
+        // Second note - Dong
+        playTone(660, startTime + 0.18, 0.35);
+
+        document.getElementById("status").textContent =
+          "🔔 Sound played!";
+
+        setTimeout(() => {
+          audioContext.close().catch(() => {});
+        }, 800);
+
+      } catch (error) {
+        console.error(error);
+
+        document.getElementById("status").textContent =
+          "Could not play the sound.";
+      }
+    }
+  </script>
+</body>
+</html>
