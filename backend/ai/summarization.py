@@ -3,89 +3,88 @@ import os
 import re
 from collections import Counter
 
-from dotenv import load_dotenv
-from google import genai
 from google.genai import types
 
-from utils.token_utils import estimate_tokens, optimize_for_tokens
+from ai.gemini_client import (
+    get_client,
+    request_with_retry,
+)
 
-load_dotenv()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
-MAX_ANALYSIS_TOKENS = int(os.getenv("MAX_ANALYSIS_TOKENS", "1000"))
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing from .env")
+# ============================================================
+# MEETING ANALYSIS PROMPT
+# ============================================================
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+PROMPT_TEMPLATE = """
+You are an AI meeting information extractor.
 
-PROMPT_TEMPLATE = """You are an AI meeting information extractor.
+Analyze the meeting transcript below.
 
-Read the transcript carefully.
+IMPORTANT RULES:
 
-Extract only information explicitly stated in the transcript.
+1. Use ONLY information explicitly stated in the transcript.
+2. Never guess or invent information.
+3. Never change names, roles, responsibilities, dates, numbers,
+   deadlines, or technical terms.
+4. A discussion is NOT automatically a decision.
+5. An opinion is NOT automatically a decision.
+6. A suggestion is NOT automatically a decision.
+7. A question is NOT automatically a decision.
+8. Only include decisions when the transcript clearly indicates
+   that something was agreed, approved, decided, or instructed.
+9. Only create an action item when a responsible person is explicitly
+   identified.
+10. Never invent a responsible person.
+11. Never invent a deadline.
+12. If a deadline is not stated, use "Not specified".
+13. If information is missing, use "Not specified".
+14. Analyze the actual meeting instead of assuming its type.
+15. Keep the results concise and useful.
 
-Never infer, guess, invent, correct, or add information that is not
-supported by the transcript.
+Return ONLY valid JSON.
 
-Do not change people's names, roles, responsibilities, numbers,
-percentages, dates, times, or technical terms.
-
-IMPORTANT DISTINCTIONS:
-
-- A discussion is not a decision.
-- An opinion is not a decision.
-- A suggestion is not a decision.
-- A question is not a decision.
-- A disagreement is not a decision.
-- A possible future action is not automatically an action item.
-
-Only include something in "decisions" when the transcript clearly
-indicates that the group agreed to it, approved it, or someone was
-explicitly instructed to do it.
-
-Only include something in "action_items" when the transcript clearly
-identifies a person responsible for a task.
-
-Do not invent a person responsible for an action.
-
-Do not create deadlines unless a deadline is explicitly stated.
-
-If a deadline is not stated, use "Not specified".
-
-If responsibility is unclear, do not assign the task to a person.
-
-Preserve uncertainty instead of guessing.
-
-If information is missing, use "Not specified".
-
-Analyze the actual content rather than assuming the meeting type.
-
-Return ONLY valid JSON with this exact structure:
+Use exactly this structure:
 
 {
-    "meeting_type": "...",
-    "summary": "...",
-    "key_points": ["..."],
-    "topics": ["..."],
-    "decisions": ["..."],
+    "meeting_type": "General Meeting",
+    "summary": "Short summary of the meeting.",
+    "key_points": [
+        "Important point 1",
+        "Important point 2"
+    ],
+    "topics": [
+        "Topic 1",
+        "Topic 2"
+    ],
+    "decisions": [
+        "Decision 1"
+    ],
     "action_items": [
         {
-            "person": "...",
-            "task": "...",
-            "deadline": "..."
+            "person": "Person name",
+            "task": "Task",
+            "deadline": "Deadline or Not specified"
         }
     ],
-    "unresolved_issues": ["..."],
-    "sentiment": "Positive"
+    "unresolved_issues": [
+        "Unresolved issue"
+    ],
+    "sentiment": "Neutral"
 }
 
-The sentiment must be one of: Positive, Neutral, Negative.
+The sentiment MUST be exactly one of:
 
-Transcript:
+Positive
+Neutral
+Negative
+
+TRANSCRIPT:
+
 {transcript}
 """
+
 
 EMPTY_ANALYSIS = {
     "meeting_type": "General Meeting",
@@ -98,59 +97,459 @@ EMPTY_ANALYSIS = {
     "sentiment": "Neutral",
 }
 
-VALID_SENTIMENTS = {"Positive", "Neutral", "Negative"}
 
-ASK_PROMPT_TEMPLATE = """You are a helpful assistant that answers questions about a meeting transcript.
+VALID_SENTIMENTS = {
+    "Positive",
+    "Neutral",
+    "Negative",
+}
+
+
+# ============================================================
+# ASK YOUR MEETING
+# ============================================================
+
+ASK_PROMPT_TEMPLATE = """
+You are a helpful assistant that answers questions about a meeting.
+
+Answer ONLY using information explicitly present in the transcript.
 
 Rules:
-- Answer only using information explicitly present in the transcript.
-- If the answer is NOT in the transcript, reply exactly:
-This information was not mentioned in the meeting.
-- Never guess or invent information.
-- Keep your answer short and clear.
 
-Transcript:
+- Do not guess.
+- Do not invent information.
+- Do not use outside knowledge.
+- If the answer is not present in the transcript, reply exactly:
+
+This information was not mentioned in the meeting.
+
+Keep the answer short and clear.
+
+TRANSCRIPT:
+
 {transcript}
 
-Question: {question}
+QUESTION:
 
-Answer:"""
+{question}
 
-MAX_ASK_TRANSCRIPT_CHARS = 10000
+ANSWER:
+"""
 
+MAX_ASK_TRANSCRIPT_CHARS = 12000
+
+
+# ============================================================
+# GEMINI REQUEST
+# ============================================================
 
 def ask_gemini(prompt, as_json=True):
-    config = None
+    """
+    Send a prompt to Gemini and return the response text.
 
-    if as_json:
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json"
+    Uses the shared robust request helper (request_with_retry), which
+    retries transient TLS / connection errors with a fresh client and
+    retries HTTP status errors (429/503/...) via the SDK. Permanent errors
+    (bad key/model/request) fail immediately.
+    """
+    print(f"[GEMINI] Model: {GEMINI_MODEL}")
+    print(f"[GEMINI] JSON mode: {as_json}")
+    print(f"[GEMINI] Prompt length: {len(prompt)} characters")
+
+    def _do_request():
+        client = get_client()
+
+        config = None
+        if as_json:
+            config = types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=config,
         )
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=config,
+        if response is None:
+            raise RuntimeError("Gemini returned no response.")
+
+        text = getattr(response, "text", None)
+
+        if not text:
+            raise RuntimeError(
+                f"Gemini returned an empty response. Raw response: {response}"
+            )
+
+        return text
+
+    text = request_with_retry(
+        _do_request,
+        description="generate_content",
     )
 
-    if not response or not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
+    print(f"[GEMINI] Response length: {len(text)} characters")
 
-    return response.text
+    return text
 
+
+# ============================================================
+# RESPONSE CLEANING
+# ============================================================
 
 def clean_answer(raw_text):
-    text = (raw_text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
+    """
+    Clean normal Gemini text responses.
+    """
 
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
-        text = text[1:-1]
+    text = (raw_text or "").strip()
+
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
 
     return text.strip()
 
 
+def parse_ai_response(raw_text):
+    """
+    Safely convert Gemini's JSON response into a Python dictionary.
+    """
+
+    text = clean_answer(raw_text)
+
+    if not text:
+        raise ValueError("Gemini returned empty JSON.")
+
+    # First try normal JSON parsing.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find the JSON object inside the response.
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(
+            f"Could not find a JSON object in Gemini response: {text[:500]}"
+        )
+
+    json_text = text[start:end + 1]
+
+    try:
+        return json.loads(json_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Invalid JSON returned by Gemini: {e}. "
+            f"Response: {json_text[:1000]}"
+        )
+
+
+# ============================================================
+# NORMALIZE AI RESULT
+# ============================================================
+
+def complete_missing_fields(result):
+    """
+    Make sure the AI result always has the expected structure.
+    """
+
+    if not isinstance(result, dict):
+        result = {}
+
+    normalized = dict(EMPTY_ANALYSIS)
+
+    normalized.update(result)
+
+    # Strings
+    normalized["meeting_type"] = (
+        str(normalized.get("meeting_type") or "General Meeting")
+        .strip()
+    )
+
+    normalized["summary"] = (
+        str(normalized.get("summary") or "Not specified")
+        .strip()
+    )
+
+    # Lists
+    for key in [
+        "key_points",
+        "topics",
+        "decisions",
+        "unresolved_issues",
+    ]:
+        value = normalized.get(key)
+
+        if not isinstance(value, list):
+            normalized[key] = []
+        else:
+            normalized[key] = [
+                str(item).strip()
+                for item in value
+                if str(item).strip()
+            ]
+
+    # Action items
+    action_items = normalized.get("action_items")
+
+    if not isinstance(action_items, list):
+        action_items = []
+
+    cleaned_action_items = []
+
+    for item in action_items:
+
+        if not isinstance(item, dict):
+            continue
+
+        cleaned_action_items.append(
+            {
+                "person": str(
+                    item.get("person") or "Not specified"
+                ).strip(),
+
+                "task": str(
+                    item.get("task") or "Not specified"
+                ).strip(),
+
+                "deadline": str(
+                    item.get("deadline") or "Not specified"
+                ).strip(),
+            }
+        )
+
+    normalized["action_items"] = cleaned_action_items
+
+    # Sentiment
+    sentiment = normalized.get("sentiment")
+
+    if sentiment not in VALID_SENTIMENTS:
+        sentiment = "Neutral"
+
+    normalized["sentiment"] = sentiment
+
+    return normalized
+
+
+# ============================================================
+# MEETING ANALYSIS
+# ============================================================
+
+# If a transcript exceeds this many *estimated tokens* (chars / 4) it is
+# chunked and each chunk is analyzed separately, then combined. This keeps
+# the analysis working for realistic, long meetings without exceeding the
+# model context. ~4 chars/token, so 20k chars ~= 5k tokens.
+MAX_SINGLE_ANALYSIS_CHARS = int(
+    os.getenv("MAX_SINGLE_ANALYSIS_CHARS", "20000")
+)
+
+
+def _chunk_transcript(transcript, max_chars=MAX_SINGLE_ANALYSIS_CHARS):
+    """
+    Split a transcript into ordered chunks that each fit within max_chars.
+    Splits on paragraph, then sentence boundaries; never drops content.
+    """
+    text = (transcript or "").strip()
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while len(remaining) > max_chars:
+        candidate = remaining[:max_chars]
+
+        # Prefer paragraph breaks.
+        pos = candidate.rfind("\n\n")
+
+        # Then sentence endings.
+        if pos < max_chars * 0.5:
+            pos = max(
+                candidate.rfind(". "),
+                candidate.rfind("? "),
+                candidate.rfind("! "),
+            )
+
+        # Last resort: split exactly at max_chars.
+        if pos < max_chars * 0.5:
+            pos = max_chars
+
+        chunk = remaining[:pos].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        remaining = remaining[pos:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
+
+def analyze_meeting(transcript):
+    """
+    Analyze the meeting transcript using Gemini.
+
+    Small transcripts are analyzed in one call. Large transcripts are split
+    into chunks, each analyzed separately, and the results combined so no
+    part of a long meeting is lost.
+
+    Returns a normalized meeting intelligence dictionary.
+    """
+
+    transcript = (transcript or "").strip()
+
+    if not transcript:
+        print("[GEMINI] Empty transcript. Skipping analysis.")
+        return complete_missing_fields({})
+
+    print(
+        f"[GEMINI] Starting meeting analysis. "
+        f"Transcript chars={len(transcript)}"
+    )
+
+    # ---- Large transcript: chunk + analyze each + combine ----
+    if len(transcript) > MAX_SINGLE_ANALYSIS_CHARS:
+
+        chunks = _chunk_transcript(transcript, MAX_SINGLE_ANALYSIS_CHARS)
+        print(
+            f"[GEMINI] Transcript is large "
+            f"({len(transcript)} chars). Splitting into "
+            f"{len(chunks)} chunks for analysis."
+        )
+
+        partial_results = []
+
+        for index, chunk in enumerate(chunks, start=1):
+            print(
+                f"[GEMINI] Analyzing chunk {index}/{len(chunks)} "
+                f"({len(chunk)} chars)..."
+            )
+
+            prompt = PROMPT_TEMPLATE.replace(
+                "{transcript}",
+                chunk,
+            )
+
+            try:
+                raw_response = ask_gemini(prompt, as_json=True)
+                result = parse_ai_response(raw_response)
+                result = complete_missing_fields(result)
+                partial_results.append(result)
+            except Exception as e:
+                print(
+                    f"[GEMINI] Chunk {index} analysis failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if partial_results:
+            combined = combine_results(partial_results)
+            print("[GEMINI] Combined chunked analysis.")
+            return combined
+
+        print("[GEMINI] All chunks failed. Returning empty fallback.")
+        return complete_missing_fields({})
+
+    # ---- Normal single-call analysis ----
+    prompt = PROMPT_TEMPLATE.replace(
+        "{transcript}",
+        transcript,
+    )
+
+    try:
+        raw_response = ask_gemini(
+            prompt,
+            as_json=True,
+        )
+
+        print("[GEMINI] Raw analysis received.")
+
+        result = parse_ai_response(raw_response)
+
+        result = complete_missing_fields(result)
+
+        print("[GEMINI] Analysis successfully parsed.")
+        print(
+            f"[GEMINI] Meeting type: {result['meeting_type']}"
+        )
+        print(
+            f"[GEMINI] Sentiment: {result['sentiment']}"
+        )
+        print(
+            f"[GEMINI] Key points: {len(result['key_points'])}"
+        )
+        print(
+            f"[GEMINI] Decisions: {len(result['decisions'])}"
+        )
+        print(
+            f"[GEMINI] Action items: {len(result['action_items'])}"
+        )
+
+        return result
+
+    except Exception as e:
+
+        # IMPORTANT:
+        # Do not hide the real Gemini error.
+        print(
+            f"[GEMINI ANALYSIS ERROR] "
+            f"{type(e).__name__}: {e}"
+        )
+
+        return empty_analysis_with_error(
+            error=e
+        )
+
+
+# ============================================================
+# ANALYSIS ERROR
+# ============================================================
+
+def empty_analysis_with_error(error=None):
+    """
+    Return a safe fallback while preserving the real error
+    in the backend terminal.
+    """
+
+    result = dict(EMPTY_ANALYSIS)
+
+    if error:
+        result["summary"] = (
+            "AI analysis failed. "
+            "Check the backend terminal for the exact Gemini error."
+        )
+    else:
+        result["summary"] = (
+            "AI analysis could not be generated."
+        )
+
+    return result
+
+
+# ============================================================
+# ASK YOUR MEETING
+# ============================================================
+
 def answer_question(meeting, question):
+    """
+    Answer a question using the meeting transcript.
+    """
+
     transcript = (
         meeting.get("transcript_cleaned")
         or meeting.get("transcript_raw")
@@ -162,137 +561,135 @@ def answer_question(meeting, question):
     if not question:
         return "Please enter a question."
 
+    # Keep the prompt within a reasonable size.
+    transcript = transcript[:MAX_ASK_TRANSCRIPT_CHARS]
+
     prompt = ASK_PROMPT_TEMPLATE.replace(
-        "{transcript}", transcript[-MAX_ASK_TRANSCRIPT_CHARS:]
+        "{transcript}",
+        transcript,
     ).replace(
-        "{question}", question
+        "{question}",
+        question,
     )
 
     try:
-        answer = clean_answer(ask_gemini(prompt, as_json=False))
-        return answer or "This information was not mentioned in the meeting."
-    except Exception as e:
-        print(f"[GEMINI ASK ERROR] {type(e).__name__}: {e}")
-        return "I could not get an answer right now. Please check your Gemini API configuration."
 
+        answer = ask_gemini(
+            prompt,
+            as_json=False,
+        )
 
-def parse_ai_response(raw_text):
-    text = (raw_text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
+        answer = clean_answer(answer)
 
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start != -1 and end != -1:
-        text = text[start:end + 1]
-
-    return json.loads(text)
-
-
-def complete_missing_fields(result):
-    if not isinstance(result, dict):
-        return dict(EMPTY_ANALYSIS)
-
-    for key, default in EMPTY_ANALYSIS.items():
-        if key not in result:
-            result[key] = default
-
-    for key in ["key_points", "topics", "decisions", "unresolved_issues"]:
-        if not isinstance(result[key], list):
-            result[key] = []
-
-    if not isinstance(result["action_items"], list):
-        result["action_items"] = []
-    else:
-        result["action_items"] = [
-            {
-                "person": item.get("person") or "Not specified",
-                "task": item.get("task") or "Not specified",
-                "deadline": item.get("deadline") or "Not specified",
-            }
-            for item in result["action_items"]
-            if isinstance(item, dict)
-        ]
-
-    result["summary"] = str(result["summary"] or "Not specified")
-    result["meeting_type"] = str(
-        result["meeting_type"] or "General Meeting"
-    )
-
-    if result.get("sentiment") not in VALID_SENTIMENTS:
-        result["sentiment"] = "Neutral"
-
-    return result
-
-
-def analyze_meeting(transcript):
-    transcript = transcript or ""
-
-    if not transcript.strip():
-        return complete_missing_fields(dict(EMPTY_ANALYSIS))
-
-    if estimate_tokens(transcript) > MAX_ANALYSIS_TOKENS:
-        try:
-            chunks = optimize_for_tokens(
-                transcript,
-                MAX_ANALYSIS_TOKENS
+        if not answer:
+            return (
+                "This information was not mentioned in the meeting."
             )
 
-            print(f"[GEMINI] Analyzing {len(chunks)} chunks...")
-
-            results = [
-                _analyze_single(chunk)
-                for chunk in chunks
-            ]
-
-            return combine_results(results)
-
-        except Exception as e:
-            print(f"[GEMINI CHUNK ERROR] {type(e).__name__}: {e}")
-            return complete_missing_fields(
-                empty_analysis_with_error()
-            )
-
-    return _analyze_single(transcript)
-
-
-def _analyze_single(transcript):
-    prompt = PROMPT_TEMPLATE.replace(
-        "{transcript}", transcript
-    )
-
-    try:
-        print(f"[GEMINI] Analyzing with {GEMINI_MODEL}...")
-
-        raw_answer = ask_gemini(prompt, as_json=True)
-        result = parse_ai_response(raw_answer)
-
-        print("[GEMINI] Analysis complete.")
-
-        return complete_missing_fields(result)
+        return answer
 
     except Exception as e:
-        print(f"[GEMINI ANALYSIS ERROR] {type(e).__name__}: {e}")
-        return complete_missing_fields(
-            empty_analysis_with_error()
+
+        print(
+            f"[GEMINI ASK ERROR] "
+            f"{type(e).__name__}: {e}"
+        )
+
+        return (
+            "I could not get an answer right now. "
+            "Please check the backend terminal."
         )
 
 
-def empty_analysis_with_error():
-    result = dict(EMPTY_ANALYSIS)
-    result["summary"] = (
-        "AI analysis could not be generated. "
-        "Please check your Gemini API key, model, and connection."
+# ============================================================
+# OPTIONAL HELPERS
+# ============================================================
+
+def _dedupe(items):
+    """
+    Remove duplicate text items while preserving order.
+    """
+
+    seen = set()
+    unique = []
+
+    for item in items:
+
+        text = str(item or "").strip()
+
+        normalized = text.lower()
+
+        if text and normalized not in seen:
+            seen.add(normalized)
+            unique.append(text)
+
+    return unique
+
+
+def _dedupe_dicts(items):
+    """
+    Remove duplicate action items.
+    """
+
+    seen = set()
+    unique = []
+
+    for item in items:
+
+        if not isinstance(item, dict):
+            continue
+
+        key = (
+            str(item.get("person", "")).strip().lower(),
+            str(item.get("task", "")).strip().lower(),
+            str(item.get("deadline", "")).strip().lower(),
+        )
+
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    return unique
+
+
+def _join_unique_texts(texts):
+    """
+    Combine unique summaries.
+    """
+
+    unique = _dedupe(texts)
+
+    return " ".join(unique)
+
+
+def _most_common(values, default):
+    """
+    Return the most common value.
+    """
+
+    if not values:
+        return default
+
+    counter = Counter(
+        str(value).strip()
+        for value in values
+        if value
     )
-    return result
+
+    if not counter:
+        return default
+
+    return counter.most_common(1)[0][0]
 
 
 def combine_results(results):
-    if not results:
-        return complete_missing_fields(dict(EMPTY_ANALYSIS))
+    """
+    Combine multiple analysis results if chunked analysis
+    is ever needed later.
+    """
 
-    combined = dict(EMPTY_ANALYSIS)
+    if not results:
+        return complete_missing_fields({})
 
     summaries = []
     key_points = []
@@ -304,6 +701,7 @@ def combine_results(results):
     sentiments = []
 
     for result in results:
+
         result = complete_missing_fields(result)
 
         summaries.append(result["summary"])
@@ -312,77 +710,49 @@ def combine_results(results):
         decisions.extend(result["decisions"])
         action_items.extend(result["action_items"])
         unresolved.extend(result["unresolved_issues"])
-        meeting_types.append(result["meeting_type"])
-        sentiments.append(result["sentiment"])
 
-    combined["summary"] = _join_unique_texts(summaries)
-    combined["key_points"] = _dedupe(key_points)
-    combined["topics"] = _dedupe(topics)
-    combined["decisions"] = _dedupe(decisions)
-    combined["action_items"] = _dedupe_dicts(action_items)
-    combined["unresolved_issues"] = _dedupe(unresolved)
-    combined["meeting_type"] = _most_common(
-        meeting_types, "General Meeting"
-    )
-    combined["sentiment"] = _most_common(
-        sentiments, "Neutral"
-    )
-
-    return complete_missing_fields(combined)
-
-
-def _dedupe(items):
-    seen = set()
-    unique = []
-
-    for item in items:
-        normalized = str(item or "").strip().lower()
-
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            unique.append(item)
-
-    return unique
-
-
-def _dedupe_dicts(items):
-    seen = set()
-    unique = []
-
-    for item in items:
-        key = (
-            str(item.get("person", "")).lower().strip(),
-            str(item.get("task", "")).lower().strip(),
-            str(item.get("deadline", "")).lower().strip(),
+        meeting_types.append(
+            result["meeting_type"]
         )
 
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
+        sentiments.append(
+            result["sentiment"]
+        )
 
-    return unique
+    combined = {
+        "meeting_type": _most_common(
+            meeting_types,
+            "General Meeting",
+        ),
 
+        "summary": _join_unique_texts(
+            summaries
+        ),
 
-def _join_unique_texts(texts):
-    result = []
+        "key_points": _dedupe(
+            key_points
+        ),
 
-    for text in texts:
-        text = (text or "").strip()
+        "topics": _dedupe(
+            topics
+        ),
 
-        if text and (not result or result[-1] != text):
-            result.append(text)
+        "decisions": _dedupe(
+            decisions
+        ),
 
-    return " ".join(result)
+        "action_items": _dedupe_dicts(
+            action_items
+        ),
 
+        "unresolved_issues": _dedupe(
+            unresolved
+        ),
 
-def _most_common(values, default):
-    if not values:
-        return default
+        "sentiment": _most_common(
+            sentiments,
+            "Neutral",
+        ),
+    }
 
-    counter = Counter(
-        str(value or "").strip()
-        for value in values
-        if value
-    )
-
-    return counter.most_common(1)[0][0] if counter else default
+    return complete_missing_fields(combined)

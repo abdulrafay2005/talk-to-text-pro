@@ -31,9 +31,21 @@ def register():
     """
     data = request.get_json(silent=True) or {}
 
-    name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
+    name = data.get("name") or ""
+    email = data.get("email") or ""
     password = data.get("password") or ""
+
+    # Defensive type handling: a non-string value (e.g. a dict/object from a
+    # malformed client) should be treated as invalid rather than crashing.
+    if not isinstance(name, str):
+        name = ""
+    if not isinstance(email, str):
+        email = ""
+    if not isinstance(password, str):
+        password = ""
+
+    name = name.strip()
+    email = email.strip().lower()
 
     if not name:
         return jsonify({"error": "Please enter your name."}), 400
@@ -61,8 +73,17 @@ def login():
     """
     data = request.get_json(silent=True) or {}
 
-    email = (data.get("email") or "").strip().lower()
+    email = data.get("email") or ""
     password = data.get("password") or ""
+
+    # Defensive type handling: a non-string value (e.g. a dict/object from a
+    # malformed client) should be treated as invalid rather than crashing.
+    if not isinstance(email, str):
+        email = ""
+    if not isinstance(password, str):
+        password = ""
+
+    email = email.strip().lower()
 
     if not email or not password:
         return jsonify({"error": "Please enter your email and password."}), 400

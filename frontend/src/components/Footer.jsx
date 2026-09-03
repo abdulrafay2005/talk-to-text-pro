@@ -9,7 +9,7 @@ function Footer() {
       <div className="footer-inner">
         <Logo />
         <span>
-          Built with React, Flask, faster-whisper &amp; Gemini
+          Built with React, Flask, Gemini &amp; MongoDB
         </span>
         <span>© {new Date().getFullYear()} TalkToText Pro</span>
       </div>

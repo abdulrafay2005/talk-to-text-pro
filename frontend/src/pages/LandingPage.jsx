@@ -45,8 +45,8 @@ const STEPS = [
 ];
 
 const FEATURES = [
-  { icon: Mic, title: "Accurate transcription", text: "faster-whisper converts speech to text with timestamps, 100% offline." },
-  { icon: Sparkles, title: "Smart summaries", text: "A local AI summarizes the meeting in clear, factual, simple language." },
+  { icon: Mic, title: "Accurate transcription", text: "Google Gemini transcribes speech to text with high accuracy." },
+  { icon: Sparkles, title: "Smart summaries", text: "Gemini summarizes the meeting in clear, factual, simple language." },
   { icon: CheckCircle2, title: "Action items & decisions", text: "Who does what and by when - extracted exactly as people said it." },
   { icon: Languages, title: "Optional translation", text: "Translate your meeting into English, Urdu, Spanish, French and more." },
   { icon: Download, title: "PDF export", text: "One click turns every meeting into a clean, shareable PDF report." },

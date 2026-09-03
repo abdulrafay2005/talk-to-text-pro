@@ -15,6 +15,10 @@ backend/generated_pdfs/*
 !backend/uploads/.gitkeep
 !backend/generated_pdfs/.gitkeep
 
+# Backend logs (may contain stack traces)
+backend/logs/*
+!backend/logs/.gitkeep
+
 # OS files
 .DS_Store
 Thumbs.db

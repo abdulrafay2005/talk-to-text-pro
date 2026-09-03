@@ -9,6 +9,14 @@ import os
 import time
 
 from bson.objectid import ObjectId
+from dotenv import load_dotenv
+
+# Load .env from an absolute path so it works from any working directory.
+_ENV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".env",
+)
+load_dotenv(_ENV_PATH)
 
 from ai.summarization import analyze_meeting, answer_question
 from ai.transcription import clean_transcript, transcribe_audio

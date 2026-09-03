@@ -137,7 +137,7 @@ def translate_meeting(meeting_id):
 @login_required
 def ask_meeting(meeting_id):
     """
-    Ask a real question about a meeting. The answer comes from Ollama
+    Ask a real question about a meeting. The answer comes from Gemini
     and uses ONLY the meeting transcript. Body:  {"question": "..."}
     """
     data = request.get_json(silent=True) or {}

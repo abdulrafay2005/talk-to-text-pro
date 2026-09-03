@@ -17,6 +17,15 @@ Security:
 import os
 import uuid
 
+from dotenv import load_dotenv
+
+# Load .env from an absolute path so it works from any working directory.
+_ENV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".env",
+)
+load_dotenv(_ENV_PATH)
+
 # Set of allowed file extensions (lowercase, without the dot).
 ALLOWED_EXTENSIONS = {"mp3", "wav", "mp4"}
 

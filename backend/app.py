@@ -5,6 +5,7 @@ This is the entry point of the Flask server.
 Run it with:  python app.py
 """
 
+import logging
 import os
 
 from flask import Flask, jsonify
@@ -13,11 +14,13 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from dotenv import load_dotenv
 
+# Load .env from an absolute path so it works from any working directory.
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_BACKEND_DIR, ".env"))
+
 from routes.auth_routes import auth_bp
 from routes.meeting_routes import meeting_bp
 from routes.pdf_generator import pdf_bp
-
-load_dotenv()
 
 
 def create_app():
@@ -26,6 +29,20 @@ def create_app():
     """
     app = Flask(__name__)
 
+    # Detect bugs by logging real errors to a file so they are visible even
+    # when the server runs minimized/headless (no attached console).
+    _logging_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(_logging_dir, exist_ok=True)
+    _log_handler = logging.FileHandler(
+        os.path.join(_logging_dir, "app.log"),
+        encoding="utf-8",
+    )
+    _log_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    app.logger.addHandler(_log_handler)
+    app.logger.setLevel(logging.INFO)
+
     # Used to sign session cookies securely.
     app.secret_key = os.getenv("SECRET_KEY", "dev-secret-change-this-in-production")
     app.config.update(
@@ -33,6 +50,26 @@ def create_app():
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=False,
     )
+
+    # Return JSON (never HTML) for unexpected errors, so the frontend always
+    # receives a parseable {"success": false, "error": ...} response instead
+    # of a generic HTML 500 page.
+    @app.errorhandler(Exception)
+    def handle_unexpected_error(error):
+        # Never leak internal details to the client; log the full traceback
+        # server-side (file + console) so bugs are easy to reproduce.
+        app.logger.exception("Unhandled exception: %s", type(error).__name__)
+        return jsonify({
+            "success": False,
+            "error": "Something went wrong on the server. Please try again later.",
+        }), 500
+
+    @app.errorhandler(404)
+    def handle_not_found(error):
+        return jsonify({
+            "success": False,
+            "error": "The requested resource was not found.",
+        }), 404
 
     # Hard upload ceiling enforced by Flask itself (in addition to the
     # per-file check in file_utils). Default 250 MB, configurable via env.
